@@ -1,8 +1,7 @@
 -- language: Luau, file: cbae.lua, runtime: Roblox
 -- target: Roblox client
 -- *deep map scanner + player/NPC/interact/place browser + respawn teleport flow*
--- *hard dedup by unique name + separate NPC / Interact tabs*
--- *UI: glassy minimal, compact 320x420, sliding tab indicator, smooth via RenderStepped*
+-- *incremental workspace registry + greying out unreachable rows + anti-AFK*
 
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
@@ -16,10 +15,13 @@ local old = PlayerGui:FindFirstChild("cbae_gui")
 if old then old:Destroy() end
 
 --==================================================
--- CUSTOM PLACES
+-- CUSTOM PLACES + CACHES
 --==================================================
 
 local CUSTOM_PLACES = {}
+local LAST_KNOWN = {}
+local LAST_KNOWN_NPC = {}
+local CACHE_MAX_AGE = 120
 
 --==================================================
 -- SETTINGS
@@ -27,7 +29,7 @@ local CUSTOM_PLACES = {}
 
 local OFFSET = CFrame.new(3, 0, 0)
 local PLACE_OFFSET = CFrame.new(0, 5, 0)
-local REFRESH_INTERVAL = 2
+local REFRESH_INTERVAL = 1
 local MAX_PLACE_RESULTS = 1000
 
 --==================================================
@@ -41,6 +43,7 @@ local T = {
 	row         = Color3.fromRGB(24, 27, 34),
 	rowHover    = Color3.fromRGB(34, 38, 48),
 	rowSelect   = Color3.fromRGB(28, 46, 46),
+	rowDisabled = Color3.fromRGB(16, 18, 22),
 	stroke      = Color3.fromRGB(60, 72, 88),
 	strokeSoft  = Color3.fromRGB(40, 48, 58),
 	accent      = Color3.fromRGB(100, 220, 210),
@@ -50,7 +53,8 @@ local T = {
 	red         = Color3.fromRGB(240, 110, 130),
 	textMain    = Color3.fromRGB(235, 240, 245),
 	textSub     = Color3.fromRGB(140, 150, 165),
-	textMuted   = Color3.fromRGB(90, 100, 115),
+	textMuted   = Color3.fromRGB(70, 78, 90),
+	textDisabled= Color3.fromRGB(80, 85, 95),
 }
 
 --==================================================
@@ -68,6 +72,67 @@ local function smoothColor(current, target, speed, dt)
 		smooth(current.B, target.B, speed, dt)
 	)
 end
+
+--==================================================
+-- WORKSPACE REGISTRY (incremental, no full walks)
+--==================================================
+
+local NPC_MODELS = {}       -- [Model] = Humanoid
+local INTERACT_ITEMS = {}   -- [Instance] = { holder = Instance, prompt = Instance }
+local REGISTRY_READY = false
+
+local function registerObject(obj)
+	if obj:IsA("Humanoid") then
+		local model = obj.Parent
+		if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
+			NPC_MODELS[model] = obj
+		end
+	elseif obj:IsA("ProximityPrompt") or obj:IsA("ClickDetector") then
+		local holder = obj.Parent
+		if holder then
+			local model = holder:FindFirstAncestorOfClass("Model") or holder
+			if model and not Players:GetPlayerFromCharacter(model) then
+				if not INTERACT_ITEMS[model] then
+					INTERACT_ITEMS[model] = { holder = model, prompt = obj }
+				end
+			end
+		end
+	elseif obj:IsA("Model") then
+		-- in case the Humanoid was added first and the parent Model registered later
+		local hum = obj:FindFirstChildOfClass("Humanoid")
+		if hum and not Players:GetPlayerFromCharacter(obj) then
+			NPC_MODELS[obj] = hum
+		end
+	end
+end
+
+local function unregisterObject(obj)
+	if NPC_MODELS[obj] then
+		NPC_MODELS[obj] = nil
+	end
+	if INTERACT_ITEMS[obj] then
+		INTERACT_ITEMS[obj] = nil
+	end
+end
+
+local function seedRegistry()
+	NPC_MODELS = {}
+	INTERACT_ITEMS = {}
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		registerObject(obj)
+	end
+	REGISTRY_READY = true
+end
+
+workspace.DescendantAdded:Connect(function(obj)
+	if not REGISTRY_READY then return end
+	registerObject(obj)
+end)
+
+workspace.DescendantRemoving:Connect(function(obj)
+	if not REGISTRY_READY then return end
+	unregisterObject(obj)
+end)
 
 --==================================================
 -- GUI ROOT
@@ -502,7 +567,7 @@ local function toast(text, color)
 	local ti = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 	TweenService:Create(t, ti, { BackgroundTransparency = 0.2 }):Play()
 	TweenService:Create(s, ti, { Transparency = 0.4 }):Play()
-	TweenService:Create(lbl, ti, { TextTransparency = 0 }):Play()
+	TweenService:Create(lbl, ti, { Transparency = 0 }):Play()
 
 	task.delay(2.0, function()
 		local to = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
@@ -526,6 +591,30 @@ local minimized = false
 local connections = {}
 local cachedPlaces = nil
 local scanInProgress = false
+
+--==================================================
+-- ANTI-AFK (silent)
+--==================================================
+
+do
+	local virtualUser = game:GetService("VirtualUser")
+	local function poke()
+		pcall(function()
+			virtualUser:CaptureController()
+			virtualUser:ClickButton2(Vector2.new())
+		end)
+	end
+	pcall(function()
+		LocalPlayer.Idled:Connect(poke)
+	end)
+	task.spawn(function()
+		while not dead do
+			task.wait(180 + math.random(120))
+			if dead then break end
+			poke()
+		end
+	end)
+end
 
 --==================================================
 -- DRAG
@@ -602,81 +691,88 @@ local function getObjectCFrame(obj)
 	if not obj or not obj.Parent then return nil end
 	if obj:IsA("BasePart") then return obj.CFrame end
 	if obj:IsA("Model") then
+		local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+		if part then return part.CFrame end
 		local ok, pivot = pcall(function() return obj:GetPivot() end)
 		if ok and typeof(pivot) == "CFrame" then return pivot end
-		if obj.PrimaryPart then return obj.PrimaryPart.CFrame end
-		local part = obj:FindFirstChildWhichIsA("BasePart", true)
-		if part then return part.CFrame end
 	end
 	return nil
 end
 
 --==================================================
--- NPC SCANNER
+-- NPC / INTERACT SCANNERS (registry-based, fast)
 --==================================================
 
 local function getNPCs()
-	local results, seenModels, seenNames = {}, {}, {}
+	local results, seenNames = {}, {}
+	local now = os.clock()
 
-	local function addEntry(name, obj, cf)
-		local key = string.lower(name)
-		if seenNames[key] then return end
-		seenNames[key] = true
-		table.insert(results, { name = name, obj = obj, cf = cf })
-	end
-
-	for _, obj in ipairs(workspace:GetDescendants()) do
-		if obj:IsA("Humanoid") then
-			local model = obj.Parent
-			if model and model:IsA("Model") and not Players:GetPlayerFromCharacter(model) then
-				local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
-				if root and not seenModels[model] then
-					seenModels[model] = true
-					addEntry(cleanName(model.Name), model, root.CFrame)
-				end
+	for model, hum in pairs(NPC_MODELS) do
+		if model.Parent and hum and hum.Parent and hum.Health > 0 then
+			local name = cleanName(model.Name)
+			local key = string.lower(name)
+			local root = model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+			if root and not seenNames[key] then
+				seenNames[key] = true
+				table.insert(results, {
+					name = name, obj = model, cf = root.CFrame,
+					hasLocation = true,
+				})
+				LAST_KNOWN_NPC[key] = { cf = root.CFrame, t = now, obj = model }
 			end
 		end
 	end
 
-	table.sort(results, function(a, b) return string.lower(a.name) < string.lower(b.name) end)
+	for key, cache in pairs(LAST_KNOWN_NPC) do
+		if not seenNames[key] then
+			local age = now - cache.t
+			if age < CACHE_MAX_AGE then
+				seenNames[key] = true
+				table.insert(results, {
+					name = "(cached) " .. key,
+					obj = nil,
+					cf = cache.cf,
+					isCached = true,
+					age = math.floor(age),
+					hasLocation = true,
+				})
+			end
+		end
+	end
+
+	table.sort(results, function(a, b)
+		local an = a.name:gsub("^%(cached%)%s*", "")
+		local bn = b.name:gsub("^%(cached%)%s*", "")
+		return string.lower(an) < string.lower(bn)
+	end)
 	return results
 end
 
---==================================================
--- INTERACT SCANNER
---==================================================
-
 local function getInteracts()
-	local results, seenModels, seenNames = {}, {}, {}
+	local results, seen = {}, {}
 
-	local function addEntry(name, obj, cf)
-		local key = string.lower(name)
-		if seenNames[key] then return end
-		seenNames[key] = true
-		table.insert(results, { name = name, obj = obj, cf = cf })
-	end
-
-	for _, prompt in ipairs(workspace:GetDescendants()) do
-		if prompt:IsA("ProximityPrompt") or prompt:IsA("ClickDetector") then
-			local holder = prompt.Parent
-			if holder then
-				local model = holder:FindFirstAncestorOfClass("Model") or holder
-				if not seenModels[model] and not Players:GetPlayerFromCharacter(model) then
-					local cf = getObjectCFrame(model)
-					if cf then
-						local name = cleanName(model.Name)
-						if prompt:IsA("ProximityPrompt") then
-							if prompt.ObjectText ~= "" and prompt.ActionText ~= "" then
-								name = cleanName(prompt.ObjectText .. " - " .. prompt.ActionText)
-							elseif prompt.ObjectText ~= "" then
-								name = cleanName(prompt.ObjectText)
-							elseif prompt.ActionText ~= "" then
-								name = cleanName(prompt.ActionText)
-							end
-						end
-						addEntry(name, model, cf)
-						seenModels[model] = true
+	for model, entry in pairs(INTERACT_ITEMS) do
+		if model.Parent and entry.prompt and entry.prompt.Parent then
+			local cf = getObjectCFrame(model)
+			if cf then
+				local name = cleanName(model.Name)
+				local prompt = entry.prompt
+				if prompt:IsA("ProximityPrompt") then
+					if prompt.ObjectText ~= "" and prompt.ActionText ~= "" then
+						name = cleanName(prompt.ObjectText .. " - " .. prompt.ActionText)
+					elseif prompt.ObjectText ~= "" then
+						name = cleanName(prompt.ObjectText)
+					elseif prompt.ActionText ~= "" then
+						name = cleanName(prompt.ActionText)
 					end
+				end
+				local key = string.lower(name)
+				if not seen[key] then
+					seen[key] = true
+					table.insert(results, {
+						name = name, obj = model, cf = cf,
+						hasLocation = true,
+					})
 				end
 			end
 		end
@@ -719,14 +815,26 @@ local function performDeepScan()
 	local function addPlace(obj, name, isCustom)
 		if #places >= MAX_PLACE_RESULTS then return end
 		local cf = typeof(obj) == "CFrame" and obj or getObjectCFrame(obj)
-		if not cf then return end
+		if not cf then
+			-- no location — still add as disabled
+			local cleaned = cleanName(name)
+			local key = string.lower(cleaned)
+			if not seenNames[key] then
+				seenNames[key] = true
+				table.insert(places, {
+					name = cleaned, cf = nil, isCustom = isCustom == true,
+					instance = obj, hasLocation = false,
+				})
+			end
+			return
+		end
 		local cleaned = cleanName(name)
 		local key = string.lower(cleaned)
 		if seenNames[key] then return end
 		seenNames[key] = true
 		table.insert(places, {
 			name = cleaned, cf = cf, isCustom = isCustom == true,
-			instance = obj,
+			instance = obj, hasLocation = true,
 		})
 	end
 
@@ -763,17 +871,39 @@ end
 local function resolveTargetCFrame(targetInfo)
 	if not targetInfo then return nil end
 
+	if targetInfo.cf and typeof(targetInfo.cf) == "CFrame" then
+		return targetInfo.cf * OFFSET
+	end
+
 	if targetInfo.type == "Player" then
 		local p = targetInfo.obj
-		if p and p.Character then
-			local root = p.Character:FindFirstChild("HumanoidRootPart")
+		if not p or not p.Parent then return nil end
+
+		local char = p.Character
+		if char and char.Parent then
+			local root = char:FindFirstChild("HumanoidRootPart")
 			if root then return root.CFrame * OFFSET end
+			local part = char:FindFirstChildWhichIsA("BasePart", true)
+			if part then return part.CFrame * OFFSET end
 		end
+
+		local cached = LAST_KNOWN[p]
+		if cached and (os.clock() - cached.t) < CACHE_MAX_AGE then
+			return cached.cf * OFFSET
+		end
+		return nil
 	elseif targetInfo.type == "NPC" or targetInfo.type == "Interact" then
 		local model = targetInfo.obj
 		if model and model.Parent then
 			local cf = getObjectCFrame(model)
 			if cf then return cf * OFFSET end
+		end
+		if targetInfo.type == "NPC" and targetInfo.name then
+			local key = string.lower(targetInfo.name):gsub("^%(cached%)%s*", "")
+			local cached = LAST_KNOWN_NPC[key]
+			if cached and (os.clock() - cached.t) < CACHE_MAX_AGE then
+				return cached.cf * OFFSET
+			end
 		end
 	elseif targetInfo.type == "Place" then
 		if typeof(targetInfo.obj) == "CFrame" then
@@ -788,48 +918,42 @@ local function executeTeleport(targetInfo)
 	if not char or not hum then return false, "Character unavailable" end
 
 	local destCF = resolveTargetCFrame(targetInfo)
-	if not destCF then return false, "Target location missing or invalid" end
+	if not destCF then return false, "no location" end
 
 	setStatus("intercepting respawn…", T.red)
 
 	local newChar = nil
 	local startTime = os.clock()
-	local conn
-
-	conn = LocalPlayer.CharacterAdded:Connect(function(c) newChar = c end)
+	local conn = LocalPlayer.CharacterAdded:Connect(function(c) newChar = c end)
 	hum.Health = 0
 
 	while not newChar do
 		if dead or cancelTravel then
-			if conn then conn:Disconnect() end
+			conn:Disconnect()
 			return false, cancelTravel and "Cancelled" or "Unloaded"
 		end
 		if os.clock() - startTime > 12 then
-			if conn then conn:Disconnect() end
+			conn:Disconnect()
 			return false, "Respawn timeout"
 		end
 		task.wait(0.05)
 	end
+	conn:Disconnect()
+	if dead or cancelTravel then return false, "Cancelled" end
 
-	if conn then conn:Disconnect() end
-	if dead or cancelTravel then
-		return false, cancelTravel and "Cancelled" or "Unloaded"
+	local root
+	for _ = 1, 120 do
+		root = newChar:FindFirstChild("HumanoidRootPart")
+		if root then break end
+		task.wait(0.03)
 	end
-
-	local root = newChar:WaitForChild("HumanoidRootPart", 5)
 	if not root then return false, "Root part failed to load" end
 
 	RunService.Stepped:Wait()
-	if dead or cancelTravel then
-		return false, cancelTravel and "Cancelled" or "Unloaded"
-	end
+	if dead or cancelTravel then return false, "Cancelled" end
 
-	if targetInfo.type == "Player" or targetInfo.type == "NPC" or targetInfo.type == "Interact" then
-		local refreshed = resolveTargetCFrame(targetInfo)
-		if refreshed then destCF = refreshed end
-	end
-
-	if not destCF then return false, "Destination disappeared" end
+	local refreshed = resolveTargetCFrame(targetInfo)
+	if refreshed then destCF = refreshed end
 
 	newChar:PivotTo(destCF)
 	return true
@@ -869,13 +993,6 @@ local function createActionButton(text, color, action)
 	bp.PaddingLeft = UDim.new(0, 14)
 	bp.Parent = btn
 
-	btn.MouseEnter:Connect(function()
-		TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundTransparency = 0 }):Play()
-	end)
-	btn.MouseLeave:Connect(function()
-		TweenService:Create(btn, TweenInfo.new(0.15), { BackgroundTransparency = 0.15 }):Play()
-	end)
-
 	btn.Activated:Connect(function()
 		if dead or traveling then return end
 
@@ -911,10 +1028,12 @@ local function createActionButton(text, color, action)
 end
 
 local function createListButton(name, targetData)
+	local disabled = targetData.hasLocation == false
+
 	local button = Instance.new("TextButton")
 	button.Name = name
 	button.Size = UDim2.new(1, 0, 0, 34)
-	button.BackgroundColor3 = T.row
+	button.BackgroundColor3 = disabled and T.rowDisabled or T.row
 	button.BackgroundTransparency = 0.2
 	button.BorderSizePixel = 0
 	button.Text = ""
@@ -945,8 +1064,8 @@ local function createListButton(name, targetData)
 	nameLabel.Size = UDim2.new(1, -20, 1, 0)
 	nameLabel.Position = UDim2.fromOffset(14, 0)
 	nameLabel.BackgroundTransparency = 1
-	nameLabel.Text = name
-	nameLabel.TextColor3 = T.textMain
+	nameLabel.Text = name .. (disabled and "   [no location]" or "")
+	nameLabel.TextColor3 = disabled and T.textDisabled or T.textMain
 	nameLabel.TextSize = 12
 	nameLabel.Font = Enum.Font.GothamMedium
 	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
@@ -955,16 +1074,22 @@ local function createListButton(name, targetData)
 
 	local state = {
 		btn = button, stroke = stroke, accentBar = accentBar, nameLabel = nameLabel,
-		hovered = false, targetData = targetData,
+		hovered = false, targetData = targetData, disabled = disabled,
 	}
 
-	button.MouseEnter:Connect(function() state.hovered = true end)
-	button.MouseLeave:Connect(function() state.hovered = false end)
+	if not disabled then
+		button.MouseEnter:Connect(function() state.hovered = true end)
+		button.MouseLeave:Connect(function() state.hovered = false end)
+	end
 
 	table.insert(rowAnimators, state)
 
 	button.Activated:Connect(function()
 		if dead or traveling then return end
+		if disabled then
+			setStatus("no location for " .. name, T.red)
+			return
+		end
 		selectedTarget = targetData
 		setStatus("locked: " .. name)
 		refreshList()
@@ -990,10 +1115,18 @@ refreshList = function()
 	if activeTab == "Players" then
 		for _, player in ipairs(Players:GetPlayers()) do
 			if player ~= LocalPlayer then
+				local pchar = player.Character
+				local proot = pchar and pchar:FindFirstChild("HumanoidRootPart")
+				if proot then
+					LAST_KNOWN[player] = { cf = proot.CFrame, t = os.clock() }
+				end
+
 				local dn, un = player.DisplayName, player.Name
 				if matchesSearch(dn) or matchesSearch(un) then
+					local hasLoc = proot ~= nil or (LAST_KNOWN[player] and (os.clock() - LAST_KNOWN[player].t) < CACHE_MAX_AGE)
 					createListButton(dn, {
 						type = "Player", obj = player, name = dn,
+						hasLocation = hasLoc and true or false,
 					})
 					total += 1
 				end
@@ -1004,6 +1137,8 @@ refreshList = function()
 			if matchesSearch(entry.name) then
 				createListButton(entry.name, {
 					type = "NPC", obj = entry.obj, name = entry.name,
+					cf = entry.cf, isCached = entry.isCached,
+					hasLocation = entry.hasLocation,
 				})
 				total += 1
 			end
@@ -1013,6 +1148,7 @@ refreshList = function()
 			if matchesSearch(entry.name) then
 				createListButton(entry.name, {
 					type = "Interact", obj = entry.obj, name = entry.name,
+					hasLocation = entry.hasLocation,
 				})
 				total += 1
 			end
@@ -1029,6 +1165,7 @@ refreshList = function()
 				createListButton(place.name, {
 					type = "Place", obj = place.cf,
 					instance = place.instance, name = place.name,
+					hasLocation = place.hasLocation,
 				})
 				total += 1
 			end
@@ -1132,6 +1269,12 @@ Teleport.Activated:Connect(function()
 		return
 	end
 
+	if selectedTarget.hasLocation == false then
+		setStatus("no location", T.red)
+		toast("no location", T.red)
+		return
+	end
+
 	traveling = true
 	cancelTravel = false
 	Teleport.Text = "Cancel Teleport"
@@ -1177,6 +1320,8 @@ RunService.RenderStepped:Connect(function(dt)
 		local s = rowAnimators[i]
 		if not s.btn.Parent then
 			table.remove(rowAnimators, i)
+		elseif s.disabled then
+			-- skip animation for disabled rows
 		else
 			local hovered = s.hovered
 			local isSelected = false
@@ -1186,11 +1331,15 @@ RunService.RenderStepped:Connect(function(dt)
 						and selectedTarget.name == s.targetData.name
 				else
 					isSelected = selectedTarget.obj == s.targetData.obj
+						and selectedTarget.name == s.targetData.name
 				end
 			end
 
 			local wantBg = isSelected and T.rowSelect or (hovered and T.rowHover or T.row)
 			local wantText = isSelected and T.accent or T.textMain
+			if s.targetData.isCached and not isSelected then
+				wantText = T.textSub
+			end
 			local wantStroke = isSelected and T.accent or T.strokeSoft
 			local wantStrokeTrans = isSelected and 0.4 or (hovered and 0.3 or 0.7)
 			local wantBarTrans = isSelected and 0 or 1
@@ -1213,6 +1362,12 @@ end)
 --==================================================
 
 task.spawn(function()
+	seedRegistry()
+	refreshList()
+	task.spawn(performDeepScan)
+end)
+
+task.spawn(function()
 	while not dead do
 		task.wait(REFRESH_INTERVAL)
 		if not traveling and not scanInProgress and not minimized
@@ -1221,6 +1376,3 @@ task.spawn(function()
 		end
 	end
 end)
-
-refreshList()
-task.spawn(performDeepScan)
