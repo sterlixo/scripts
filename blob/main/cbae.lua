@@ -1,9 +1,3 @@
--- language: Luau, file: cbae.lua, runtime: Roblox
--- target: Roblox client
--- *deep map scanner + player/NPC/interact/place browser + respawn teleport flow*
--- *hard dedup by unique name + separate NPC / Interact tabs*
--- *UI: glassy minimal, compact 320x420, sliding tab indicator, smooth via RenderStepped*
-
 local Players = game:GetService("Players")
 local UIS = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
